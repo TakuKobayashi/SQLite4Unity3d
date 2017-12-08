@@ -26,11 +26,13 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Threading;
+using System.Text;
 
 #if USE_CSHARP_SQLITE
 using Sqlite3 = Community.CsharpSqlite.Sqlite3;
@@ -3374,4 +3376,196 @@ namespace SQLite4Unity3d
 			Null = 5
 		}
 	}
+
+    /// <summary>
+    /// <para>SQLを直接組み立てる方がいい場合があるので、その場合組み立てるための共通処理を置いていく</para>
+    /// </summary>
+    public class SQLBuildHelper
+    {
+        /// <summary>
+        /// <para>SQLを組み立てるときstring型ならシングルクオートでくくる</para>
+        /// <para>【第1引数】チェックする値</para>
+        /// </summary>
+        public static string EscapeQueryString(object obj)
+        {
+            if (obj == null)
+            {
+                return "NULL";
+            }
+            if (obj.GetType() == typeof(string))
+            {
+                return string.Format("'{0}'", obj);
+            }
+            return obj.ToString();
+        }
+
+        /// <summary>
+        /// <para>SQLのWhere句を構築するための処理をまとめたもの</para>
+        /// <para>【第1引数】Where句で絞りこむkey(カラム名)->value(値)</para>
+        /// </summary>
+        public static string GenerateFilterQueryString(Dictionary<string, object> filterDic)
+        {
+            List<string> whereQueries = new List<string>();
+            List<string> keys = filterDic.Keys.ToList();
+            for (int i = 0; i < keys.Count; ++i)
+            {
+                object value = filterDic[keys[i]];
+                if (value == null)
+                {
+                    whereQueries.Add(string.Format("{0} IS NULL", keys[i].ToString()));
+                }
+                else if (value is IEnumerable && value.GetType() != typeof(string))
+                {
+                    List<string> inValues = new List<string>();
+                    IEnumerable list = (IEnumerable)value;
+                    IEnumerator enumerator = list.GetEnumerator();
+                    while (enumerator.MoveNext())
+                    {
+                        object item = enumerator.Current;
+                        inValues.Add(EscapeQueryString(item));
+                    }
+                    whereQueries.Add(string.Format("{0} IN ({1})", keys[i].ToString(), string.Join(",", inValues.ToArray())));
+                }
+                else
+                {
+                    whereQueries.Add(string.Format("{0} = {1}", keys[i].ToString(), EscapeQueryString(value)));
+                }
+            }
+            return string.Join(" AND ", whereQueries.ToArray());
+        }
+
+        /// <summary>
+        /// <para>SQLのSelect文を構築するための処理をまとめたもの</para>
+        /// <para>【第1引数】Table名</para>
+        /// <para>【第2引数】Where句で絞りこむkey(カラム名)->value(値)</para>
+        /// </summary>
+        public static string GenerateSelectQueryString(string tableName, Dictionary<string, object> filterDic)
+        {
+            StringBuilder queryBuilder = new StringBuilder(string.Format("SELECT * FROM {0}", tableName));
+            if (filterDic != null && filterDic.Count > 0)
+            {
+                queryBuilder.Append(string.Format(" WHERE {0}", SQLBuildHelper.GenerateFilterQueryString(filterDic)));
+            }
+
+            queryBuilder.Append(";");
+            return queryBuilder.ToString();
+        }
+
+        /// <summary>
+        /// <para>SQLite4Unity3dの仕様に則ったobjectでもってUpdate文のSQLを作成する</para>
+        /// <para>※複合PrimaryKeyが指定できないものを仮想的に実現させているため、Update文の作り方を少し工夫する必要があるのでこの処理が存在する</para>
+        /// <para>【第1引数】新しく定義されたInstance</para>
+        /// </summary>
+        public static string GenerateUpdateQueryFromObject(object newInstance)
+        {
+            StringBuilder queryBuilder = new StringBuilder(string.Format("UPDATE {0} SET ", CustomDataService.Instance.GetTableName(newInstance.GetType())));
+            List<TableMapping.Column> columns = CustomDataService.Instance.LoadColumns(newInstance.GetType());
+
+            List<List<TableMapping.Column>> virtualPrimaryKeyColumns = RDBUtil.GetVirtualPrimaryKeyColumnCombination(newInstance.GetType());
+            Dictionary<string, object> whereQueryDic = new Dictionary<string, object>();
+
+            List<string> setQueryList = new List<string>();
+            for (int i = 0; i < columns.Count; ++i)
+            {
+                // 仮想的なPrimaryKeyと本当のPrimaryKeyは更新しない
+                if (virtualPrimaryKeyColumns.Exists((pkc) => pkc.Exists((pk) => pk.Name == columns[i].Name)) || columns[i].IsPK)
+                {
+                    continue;
+                }
+                setQueryList.Add(string.Format("{0} = {1}", columns[i].Name, EscapeQueryString(columns[i].GetValue(newInstance))));
+            }
+
+            for (int i = 0; i < virtualPrimaryKeyColumns.Count; ++i)
+            {
+                for (int j = 0; j < virtualPrimaryKeyColumns[i].Count; ++j)
+                {
+                    whereQueryDic.Add(virtualPrimaryKeyColumns[i][j].Name, virtualPrimaryKeyColumns[i][j].GetValue(newInstance));
+                }
+            }
+            queryBuilder.Append(string.Join(",", setQueryList.ToArray()));
+            queryBuilder.Append(string.Format(" WHERE {0}", GenerateFilterQueryString(whereQueryDic)));
+            return queryBuilder.ToString();
+        }
+
+        /// <summary>
+        /// <para>SQLite4Unity3dの仕様に則ったobjectでもってInsert文のSQLを作成する</para>
+        /// <para>【第1引数】新しく定義されたInstance</para>
+        /// </summary>
+        public static string GenerateInsertQueryFromObject(Type instanceType, object instance)
+        {
+            List<TableMapping.Column> columns = CustomDataService.Instance.LoadColumns(instanceType);
+            List<TableMapping.Column> insertColumns = columns.FindAll((column) => !column.IsAutoInc);
+            string extra_query = GenerateInsertCommonQuery(CustomDataService.Instance.GetTableName(instanceType), insertColumns, instance);
+            if (string.IsNullOrEmpty(extra_query))
+            {
+                return string.Empty;
+            }
+            else
+            {
+                return string.Format("INSERT INTO {0}", extra_query);
+            }
+        }
+
+        /// <summary>
+        /// <para>SQLite4Unity3dの仕様に則ったobjectでもってInsert Or Replace文のSQLを作成する</para>
+        /// <para>【第1引数】新しく定義されたInstance</para>
+        /// </summary>
+        public static string GenerateInsertOrReplaceQueryFromObject(Type instanceType, object instance)
+        {
+            List<TableMapping.Column> columns = CustomDataService.Instance.LoadColumns(instanceType);
+            string extra_query = GenerateInsertCommonQuery(CustomDataService.Instance.GetTableName(instanceType), columns, instance);
+            if (string.IsNullOrEmpty(extra_query))
+            {
+                return string.Empty;
+            }
+            else
+            {
+                return string.Format("INSERT OR REPLACE INTO {0}", extra_query);
+            }
+        }
+
+        private static string GenerateInsertCommonQuery(string baseQuery, List<TableMapping.Column> insertColumns, object instances)
+        {
+            List<string> columnNames = new List<string>();
+            List<string> valueQueries = new List<string>();
+            ArrayList insertInstances = new ArrayList();
+            if (instances is IEnumerable)
+            {
+                IEnumerator enumerator = ((IEnumerable)instances).GetEnumerator();
+                while (enumerator.MoveNext())
+                {
+                    insertInstances.Add(enumerator.Current);
+                }
+            }
+            else
+            {
+                insertInstances.Add(instances);
+            }
+            // 一件もないケースはありうるのでその時はクエリを作らない。
+            if (insertInstances.Count <= 0)
+            {
+                return string.Empty;
+            }
+
+            StringBuilder queryBuilder = new StringBuilder(baseQuery);
+
+            for (int i = 0; i < insertColumns.Count; ++i)
+            {
+                columnNames.Add(insertColumns[i].Name);
+            }
+            queryBuilder.AppendFormat("({0})", string.Join(",", columnNames.ToArray()));
+            queryBuilder.Append(" VALUES ");
+            for (int i = 0; i < insertInstances.Count; ++i)
+            {
+                List<string> values = new List<string>();
+                for (int j = 0; j < insertColumns.Count; ++j)
+                {
+                    values.Add(EscapeQueryString(insertColumns[j].GetValue(insertInstances[i])));
+                }
+                valueQueries.Add(string.Format("({0})", string.Join(",", values.ToArray())));
+            }
+            queryBuilder.Append(string.Join(",", valueQueries.ToArray()));
+            return queryBuilder.ToString();
+        }
+    }
 }
